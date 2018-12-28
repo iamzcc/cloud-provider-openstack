@@ -19,6 +19,10 @@ package openstack
 import (
 	"fmt"
 	"time"
+	"strings"
+	"io/ioutil"
+	"path"
+	"path/filepath"
 
 	"github.com/gophercloud/gophercloud/openstack/blockstorage/v3/volumes"
 	"github.com/gophercloud/gophercloud/openstack/compute/v2/extensions/volumeattach"
@@ -41,6 +45,7 @@ const (
 	diskDetachInitDelay      = 1 * time.Second
 	diskDetachFactor         = 1.2
 	diskDetachSteps          = 13
+	metadataVersion          = "2015-10-15"
 )
 
 type Volume struct {
@@ -241,6 +246,114 @@ func (os *OpenStack) WaitDiskDetached(instanceID string, volumeID string) error 
 	}
 
 	return err
+}
+
+// GetDevicePathBySerialID returns the path of an attached block storage volume, specified by its id.
+func GetDevicePathBySerialID(volumeID string) string {
+	// Build a list of candidate device paths.
+	// Certain Nova drivers will set the disk serial ID, including the Cinder volume id.
+	candidateDeviceNodes := []string{
+		// KVM
+		fmt.Sprintf("virtio-%s", volumeID[:20]),
+		// KVM virtio-scsi
+		fmt.Sprintf("scsi-0QEMU_QEMU_HARDDISK_%s", volumeID[:20]),
+		// ESXi
+		fmt.Sprintf("wwn-0x%s", strings.Replace(volumeID, "-", "", -1)),
+	}
+
+	files, _ := ioutil.ReadDir("/dev/disk/by-id/")
+
+	for _, f := range files {
+		for _, c := range candidateDeviceNodes {
+			if c == f.Name() {
+				glog.V(4).Infof("Found disk attached as %q; full devicepath: %s\n", f.Name(), path.Join("/dev/disk/by-id/", f.Name()))
+				return path.Join("/dev/disk/by-id/", f.Name())
+			}
+		}
+	}
+
+	glog.V(4).Infof("Failed to find device for the volumeID: %q by serial ID", volumeID)
+	return ""
+}
+
+func getDevicePathFromInstanceMetadata(volumeID string) string {
+	// Nova Hyper-V hosts cannot override disk SCSI IDs. In order to locate
+	// volumes, we're querying the metadata service. Note that the Hyper-V
+	// driver will include device metadata for untagged volumes as well.
+	//
+	// We're avoiding using cached metadata (or the configdrive),
+	// relying on the metadata service.
+	instanceMetadata, err := getMetadataFromMetadataService(
+		metadataVersion)
+
+	if err != nil {
+		glog.V(4).Infof(
+			"Could not retrieve instance metadata. Error: %v", err)
+		return ""
+	}
+
+	for _, device := range instanceMetadata.Devices {
+		if device.Type == "disk" && device.Serial == volumeID {
+			glog.V(4).Infof(
+				"Found disk metadata for volumeID %q. Bus: %q, Address: %q",
+				volumeID, device.Bus, device.Address)
+
+			diskPattern := fmt.Sprintf(
+				"/dev/disk/by-path/*-%s-%s",
+				device.Bus, device.Address)
+			diskPaths, err := filepath.Glob(diskPattern)
+			if err != nil {
+				glog.Errorf(
+					"could not retrieve disk path for volumeID: %q. Error filepath.Glob(%q): %v",
+					volumeID, diskPattern, err)
+				return ""
+			}
+
+			if len(diskPaths) == 1 {
+				return diskPaths[0]
+			}
+
+			glog.Errorf(
+				"expecting to find one disk path for volumeID %q, found %d: %v",
+				volumeID, len(diskPaths), diskPaths)
+			return ""
+		}
+	}
+
+	glog.V(4).Infof(
+		"Could not retrieve device metadata for volumeID: %q", volumeID)
+	return ""
+}
+
+// GetDevicePath returns the path of an attached block storage volume, specified by its id.
+func GetDevicePath(volumeID string) (string, error) {
+	backoff := wait.Backoff{
+		Duration: operationFinishInitDelay,
+		Factor:   operationFinishFactor,
+		Steps:    operationFinishSteps,
+	}
+
+	var devicePath string
+	err := wait.ExponentialBackoff(backoff, func() (bool, error) {
+		devicePath = GetDevicePathBySerialID(volumeID)
+		if devicePath != "" {
+			return true, nil
+		}
+		glog.V(5).Infof("************GetDevicePathBySerialID DevicePath: %q*****************", devicePath)
+		devicePath = getDevicePathFromInstanceMetadata(volumeID)
+		if devicePath != "" {
+			return true, nil
+		}
+		glog.V(5).Infof("************getDevicePathFromInstanceMetadata DevicePath: %q*****************", devicePath)
+		return false, nil
+	})
+
+	if err == wait.ErrWaitTimeout {
+		return "", fmt.Errorf("Failed to find device for the volumeID: %q within the alloted time", volumeID)
+	} else if devicePath == "" {
+		return "", fmt.Errorf("Device path was empty for volumeID: %q", volumeID)
+	}
+	return devicePath, nil
 }
 
 // GetAttachmentDiskPath gets device path of attached volume to the compute
