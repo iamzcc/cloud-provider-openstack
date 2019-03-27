@@ -155,6 +155,7 @@ func (cs *controllerServer) ControllerPublishVolume(ctx context.Context, req *cs
 	// Publish Volume Info
 	pvInfo := map[string]string{}
 	pvInfo["DevicePath"] = devicePath
+	pvInfo["VolumeID"] = volumeID
 
 	return &csi.ControllerPublishVolumeResponse{
 		PublishInfo: pvInfo,

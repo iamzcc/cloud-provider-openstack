@@ -25,6 +25,7 @@ import (
 
 	csicommon "github.com/kubernetes-csi/drivers/pkg/csi-common"
 	"k8s.io/cloud-provider-openstack/pkg/csi/cinder/mount"
+	"k8s.io/cloud-provider-openstack/pkg/csi/cinder/openstack"
 )
 
 type nodeServer struct {
@@ -60,7 +61,14 @@ func (ns *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 
 	targetPath := req.GetTargetPath()
 	fsType := req.GetVolumeCapability().GetMount().GetFsType()
-	devicePath := req.GetPublishInfo()["DevicePath"]
+	// devicePath := req.GetPublishInfo()["DevicePath"]
+	volumeID := req.GetPublishInfo()["VolumeID"]
+
+	devicePath, err := openstack.GetDevicePath(volumeID)
+	if err != nil {
+		glog.V(3).Infof("Failed to GetDevicePath: %v", err)
+		return nil, err
+	}
 
 	// Get Mount Provider
 	m, err := mount.GetMountProvider()
